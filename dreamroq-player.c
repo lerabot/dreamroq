@@ -13,8 +13,7 @@ static pvr_ptr_t textures[2];
 static int current_frame = 0;
 
 static int render_cb(void *buf_ptr, int width, int height, int stride,
-    int texture_height, int colorspace)
-{
+    int texture_height, int colorspace) {
     pvr_poly_cxt_t cxt;
     static pvr_poly_hdr_t hdr[2];
     static pvr_vertex_t vert[4];
@@ -105,13 +104,11 @@ static int render_cb(void *buf_ptr, int width, int height, int stride,
     return ROQ_SUCCESS;
 }
 
-int audio_cb(unsigned char *buf_rgb565, int samples, int channels)
-{
+int audio_cb(unsigned char *buf_rgb565, int samples, int channels) {
     return ROQ_SUCCESS;
 }
 
-static int quit_cb()
-{
+static int quit_cb() {
     maple_device_t *cont;
     cont = maple_enum_type(0, MAPLE_FUNC_CONTROLLER);
 
@@ -122,13 +119,15 @@ static int quit_cb()
     return (state->buttons & CONT_START);
 }
 
-int finish_cb()
-{
+int finish_cb() {
     return ROQ_SUCCESS;
 }
 
-int main()
-{
+/* romdisk */
+extern uint8 romdisk[];
+KOS_INIT_ROMDISK(romdisk);
+
+int main() {
     int status;
     roq_callbacks_t cbs;
 
@@ -140,7 +139,7 @@ int main()
     vid_set_mode(DM_640x480_NTSC_IL, PM_RGB565);
     pvr_init_defaults();
 
-    status = dreamroq_play("/cd/venuscubes.roq", ROQ_RGB565, 1, &cbs);
+    status = dreamroq_play("/rd/test.roq", ROQ_RGB565, 1, &cbs);
     printf("dreamroq_play() status = %d\n", status);
 
     return 0;
