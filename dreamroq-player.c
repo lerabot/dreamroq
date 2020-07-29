@@ -1,31 +1,84 @@
 /*
  * Dreamroq by Mike Melanson
+ * Updated by Josh Pearson to add audio support
  *
  * This is the sample Dreamcast player app, designed to be run under
  * the KallistiOS operating system.
  */
 
-#include "kos.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <dc/pvr.h>
+#include <dc/maple.h>
+#include <dc/maple/controller.h>
+#include <kos/mutex.h>
+#include <kos/thread.h>
 
 #include "dreamroqlib.h"
 
+#include "dc_timer.h"
+#include "snddrv.h"
+
+/* Audio Global variables */
+#define PCM_BUF_SIZE 1024*1024
+static unsigned char *pcm_buf = NULL;
+static int pcm_size = 0;
+static int audio_init = 0;
+static mutex_t * pcm_mut;
+
+/* Video Global variables */
 static pvr_ptr_t textures[2];
 static int current_frame = 0;
+static int graphics_initialized = 0;
+static float video_delay;
+static int frame=0;
+static const float VIDEO_RATE = 30.0f; /* Video FPS */
 
-static int render_cb(void *buf_ptr, int width, int height, int stride,
-    int texture_height, int colorspace) {
+static void snd_thd()
+{
+    do
+    {
+        /* Wait for AICA Driver to request some samples */
+        while( snddrv.buf_status != SNDDRV_STATUS_NEEDBUF )
+            thd_pass();
+
+        /* Wait for RoQ Decoder to produce enough samples */
+        while( pcm_size < snddrv.pcm_needed )
+        {
+            if( snddrv.dec_status == SNDDEC_STATUS_DONE )
+                goto done;
+            thd_pass();
+        }
+
+        /* Copy the Requested PCM Samples to the AICA Driver */
+        mutex_lock( pcm_mut );
+        memcpy( snddrv.pcm_buffer, pcm_buf, snddrv.pcm_needed );
+
+        /* Shift the Remaining PCM Samples Back */
+        pcm_size -= snddrv.pcm_needed;
+        memmove( pcm_buf, pcm_buf+snddrv.pcm_needed, pcm_size );
+        mutex_unlock( pcm_mut );
+
+        /* Let the AICA Driver know the PCM samples are ready */
+        snddrv.buf_status = SNDDRV_STATUS_HAVEBUF;
+
+    } while( snddrv.dec_status == SNDDEC_STATUS_STREAMING );
+    done:
+    snddrv.dec_status = SNDDEC_STATUS_NULL;
+}
+
+static int render_cb(unsigned short *buf, int width, int height, int stride,
+    int texture_height)
+{
     pvr_poly_cxt_t cxt;
     static pvr_poly_hdr_t hdr[2];
     static pvr_vertex_t vert[4];
-    unsigned short *buf = (unsigned short*)buf_ptr;
 
     float ratio;
     /* screen coordinates of upper left and bottom right corners */
     static int ul_x, ul_y, br_x, br_y;
-    static int graphics_initialized = 0;
-
-    if (colorspace != ROQ_RGB565)
-        return ROQ_RENDER_PROBLEM;
 
     /* on first call, initialize textures and drawing coordinates */
     if (!graphics_initialized)
@@ -38,9 +91,9 @@ static int render_cb(void *buf_ptr, int width, int height, int stride,
         }
 
         /* Precompile the poly headers */
-        pvr_poly_cxt_txr(&cxt, PVR_LIST_OP_POLY, PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED, stride, texture_height, textures[0], PVR_FILTER_NONE);
+        pvr_poly_cxt_txr(&cxt, PVR_LIST_OP_POLY, PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED, stride, texture_height, textures[0], PVR_FILTER_TRILINEAR2);
         pvr_poly_compile(&hdr[0], &cxt);
-        pvr_poly_cxt_txr(&cxt, PVR_LIST_OP_POLY, PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED, stride, texture_height, textures[1], PVR_FILTER_NONE);
+        pvr_poly_cxt_txr(&cxt, PVR_LIST_OP_POLY, PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED, stride, texture_height, textures[1], PVR_FILTER_TRILINEAR2);
         pvr_poly_compile(&hdr[1], &cxt);
 
         /* this only works if width ratio <= height ratio */
@@ -77,11 +130,17 @@ static int render_cb(void *buf_ptr, int width, int height, int stride,
         vert[3].u = 1.0;
         vert[3].v = 1.0;
 
+        /* Get current hardware timing */
+        video_delay = (float)dc_get_time();
+
         graphics_initialized = 1;
     }
 
     /* send the video frame as a texture over to video RAM */
     pvr_txr_load(buf, textures[current_frame], stride * texture_height * 2);
+
+    /* Delay the frame to match Frame Rate */
+    frame_delay( VIDEO_RATE, video_delay, ++frame );
 
     pvr_wait_ready();
     pvr_scene_begin();
@@ -104,43 +163,88 @@ static int render_cb(void *buf_ptr, int width, int height, int stride,
     return ROQ_SUCCESS;
 }
 
-int audio_cb(unsigned char *buf_rgb565, int samples, int channels) {
+static int audio_cb( unsigned char *buf, int size, int channels)
+{
+    if(!audio_init)
+    {
+        /* allocate PCM buffer */
+        pcm_buf = malloc(PCM_BUF_SIZE);
+        if( pcm_buf == NULL )
+            return ROQ_NO_MEMORY;
+
+        /* Start AICA Driver */
+        snddrv_start( 22050, channels );
+        snddrv.dec_status = SNDDEC_STATUS_STREAMING;
+
+        /* Create a thread to stream the samples to the AICA */
+        thd_create(1, snd_thd, NULL );
+
+        /* Create a mutex to handle the double-threaded buffer */
+        pcm_mut = mutex_create();
+
+        audio_init=1;
+    }
+
+    /* Copy the decoded PCM samples to our local PCM buffer */
+    mutex_lock( pcm_mut );
+    memcpy(  pcm_buf+pcm_size, buf, size);
+    pcm_size += size;
+    mutex_unlock( pcm_mut );
+
     return ROQ_SUCCESS;
 }
 
-static int quit_cb() {
-    maple_device_t *cont;
-    cont = maple_enum_type(0, MAPLE_FUNC_CONTROLLER);
+static int quit_cb()
+{
+  maple_device_t *cont;
+  cont = maple_enum_type(0, MAPLE_FUNC_CONTROLLER);
 
-    cont_state_t *state;
-    state = maple_dev_status(cont);
+  cont_state_t *state;
+  state = maple_dev_status(cont);
 
-    state->buttons = ~state->buttons;
-    return (state->buttons & CONT_START);
+  state->buttons = ~state->buttons;
+  return (state->buttons & CONT_START);
 }
 
-int finish_cb() {
-    return ROQ_SUCCESS;
+static int decode_audio() {
+  if(audio_init)
+  {
+    snddrv.dec_status = SNDDEC_STATUS_DONE;  /* Singal audio thread to stop */
+    while( snddrv.dec_status != SNDDEC_STATUS_NULL )
+       thd_pass();
+    free( pcm_buf );
+    pcm_buf = NULL;
+    pcm_size = 0;
+    mutex_destroy(pcm_mut);                  /* Destroy the PCM mutex */
+    snddrv_exit();                           /* Exit the AICA Driver */
+  }
+  return(1);
 }
 
 /* romdisk */
 extern uint8 romdisk[];
 KOS_INIT_ROMDISK(romdisk);
 
-int main() {
-    int status;
-    roq_callbacks_t cbs;
+int main()
+{
+    int status=0;
 
-    cbs.render_cb = render_cb;
-    cbs.audio_cb = audio_cb;
-    cbs.quit_cb = quit_cb;
-    cbs.finish_cb = finish_cb;
-
-    vid_set_mode(DM_640x480_NTSC_IL, PM_RGB565);
+    vid_set_mode(DM_640x480, PM_RGB565);
     pvr_init_defaults();
 
-    status = dreamroq_play("/rd/test.roq", ROQ_RGB565, 1, &cbs);
+    printf("dreamroq_play(C) Multimedia Mike Melanson & Josh PH3NOM Pearson 2011\n");
+
+    /* To disable a callback, simply replace the function name by 0 */
+    //status = dreamroq_play("/cd/test.roq", 0, render_cb, audio_cb, quit_cb);
+    status = dreamroq_play("/cd/queen.roq", 0, render_cb, audio_cb, 0);
+
     printf("dreamroq_play() status = %d\n", status);
+
+    if(graphics_initialized)
+    {
+        pvr_mem_free( textures[0] );           /* Free the PVR memory */
+        pvr_mem_free( textures[1] );
+    }
 
     return 0;
 }

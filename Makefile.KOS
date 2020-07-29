@@ -33,3 +33,7 @@ run: $(TARGET)
 dist:
 	rm -f $(OBJS) romdisk.o romdisk.img
 	$(KOS_STRIP) $(TARGET)
+
+cdi:
+	@mkisofs -C 0,11702 -V DreamROQ_R2 -G $(KOS_BASE)/IP.BIN -r -J -l -m '*.o'-o DreamROQ_R2.iso .
+	@$(KOS_BASE)/utils/cdi4dc/cdi4dc DreamROQ_R2.iso DreamROQ_R2.cdi -d > cdi4dc.log
